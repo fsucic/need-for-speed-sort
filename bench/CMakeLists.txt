@@ -13,6 +13,7 @@ add_executable(nfsbench bench.cpp)
 target_include_directories(nfsbench PRIVATE
   ${CMAKE_SOURCE_DIR}/..
   ${CMAKE_SOURCE_DIR}/third_party/ips4o/include
+  ${CMAKE_SOURCE_DIR}/third_party/ips2ra/include
   ${CMAKE_SOURCE_DIR}/third_party/pdqsort
   ${CMAKE_SOURCE_DIR}/third_party/bls/include)
 find_package(TBB REQUIRED)

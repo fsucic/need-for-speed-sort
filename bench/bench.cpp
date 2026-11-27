@@ -3,7 +3,7 @@
 // (steady_clock), and every output is validated.
 //
 //   nfsbench --dist uniform --n 1000000 [--type u64|i64|u32|f64] [--runs 10]
-//            [--algos nfss,std,pdq,ips4o,spread,bls]  (also: nfss_base = original nfss.h) [--seed 42] [--data DIR]
+//            [--algos nfss,std,pdq,ips4o,ips2ra,spread,bls]  (also: nfss_base = original nfss.h) [--seed 42] [--data DIR]
 //
 // CSV rows on stdout: dist,type,n,algo,run,ns. A median summary goes to stderr.
 
@@ -37,6 +37,7 @@
 // Sequential ips4o only: Apple headers define _REENTRANT, which would pull in its TBB parallel path.
 #undef _REENTRANT
 #include "ips4o.hpp"
+#include "ips2ra.hpp"
 #include <boost/sort/spreadsort/spreadsort.hpp>
 // BLS relies on glibc's `uint` typedef and GCC VLAs (build with g++).
 using uint = unsigned int;
@@ -239,6 +240,20 @@ static void generate(const Options &o, std::vector<T> &v, std::mt19937_64 &rng, 
 // Algorithms
 // ---------------------------------------------------------------------------
 
+// IPS2Ra sorts by an unsigned key; map signed and floating keys to an order-preserving unsigned image.
+template <typename T>
+static auto radix_key(T x) {
+    if constexpr (std::is_unsigned_v<T>) {
+        return x;
+    } else if constexpr (std::is_integral_v<T>) {
+        using U = std::make_unsigned_t<T>;
+        return static_cast<U>(static_cast<U>(x) ^ (U{1} << (8 * sizeof(T) - 1)));
+    } else {
+        uint64_t bits = std::bit_cast<uint64_t>(x);
+        return bits >> 63 ? ~bits : bits | (uint64_t{1} << 63);
+    }
+}
+
 template <typename T>
 static std::map<std::string, std::function<void(std::vector<T> &)>> algorithms() {
     using It = typename std::vector<T>::iterator;
@@ -254,6 +269,7 @@ static std::map<std::string, std::function<void(std::vector<T> &)>> algorithms()
         {"std", [](auto &v) { std::sort(v.begin(), v.end()); }},
         {"pdq", [](auto &v) { pdqsort(v.begin(), v.end()); }},
         {"ips4o", [](auto &v) { ips4o::sort(v.begin(), v.end()); }},
+        {"ips2ra", [](auto &v) { ips2ra::sort(v.begin(), v.end(), [](T x) { return radix_key(x); }); }},
         {"spread", [](auto &v) { boost::sort::spreadsort::spreadsort(v.begin(), v.end()); }},
         {"bls", [](auto &v) {
              ls_framework::sort<indexes::BalancedMinMaxIndex<It>, indexes::MinMaxIndex<It>, 600>(v.begin(), v.end());

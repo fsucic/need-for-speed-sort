@@ -11,7 +11,7 @@ from pathlib import Path
 
 FIELDS = ["dist", "type", "n", "algo", "run", "ns"]
 CACHE_FIELDS = ["dist", "type", "n", "algo", "runs", "median_ns", "status", "lower_bound_ns"]
-EXTERNAL = ["bls", "pdq", "ips4o", "spread", "std"]
+EXTERNAL = ["bls", "pdq", "ips4o", "ips2ra", "spread", "std"]
 
 
 def key(row):

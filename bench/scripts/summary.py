@@ -38,7 +38,7 @@ def main():
     if cache.exists() and cache.resolve() != Path(args[0]).resolve():
         requested_cells = {k[:3] for k in base}
         for key, value in load(cache).items():
-            if key[:3] in requested_cells and key[3] in ("bls", "pdq", "ips4o", "spread", "std"):
+            if key[:3] in requested_cells and key[3] in ("bls", "pdq", "ips4o", "ips2ra", "spread", "std"):
                 base.setdefault(key, value)
     algos = sorted({a for _, _, _, a in base})
     candidates = [a for a in ("nfss", "radix", "classic") if a in algos]
