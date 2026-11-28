@@ -41,18 +41,23 @@ def main():
             if key[:3] in requested_cells and key[3] in ("bls", "pdq", "ips4o", "ips2ra", "spread", "std"):
                 base.setdefault(key, value)
     algos = sorted({a for _, _, _, a in base})
-    candidates = [a for a in ("nfss", "radix", "classic") if a in algos]
+    candidates = [a for a in ("nfss", "radix", "classic", "lowmem2", "classic5") if a in algos]
     groups = defaultdict(list)
     print("```text")
     print(f"{'dist':16} {'type':>4} {'n':>11} " + " ".join(f"{a:>9}" for a in algos) + "   " + "   ".join(f"best/{a}" for a in candidates))
     for dist, typ, n in sorted({(d, t, n) for d, t, n, _ in base}):
         row = {a: base.get((dist, typ, n, a)) for a in algos}
-        competitors = [v for a, v in row.items() if a not in ("nfss", "nfss_base", "radix", "classic") and v is not None]
+        competitors = [v for a, v in row.items() if a not in ("nfss", "nfss_base", "radix", "classic", "lowmem2", "classic5") and v is not None]
         pattern = dist in ("sorted", "reverse") or dist.startswith(("organpipe", "nearlysorted", "runs", "tail"))
         for candidate in candidates:
             if not row.get(candidate):
                 continue
-            for label, reference in (("original", row.get("nfss_base")), ("best competitor", min(competitors, default=None))):
+            references = [("original", row.get("nfss_base")), ("best competitor", min(competitors, default=None))]
+            if candidate == "lowmem2":
+                references.extend((a, row.get(a)) for a in ("nfss", "classic5", "radix", "ips2ra"))
+            if candidate == "classic5":
+                references.extend((a, row.get(a)) for a in ("nfss", "lowmem2", "radix"))
+            for label, reference in references:
                 if reference:
                     for subset in (("all",) if pattern else ("all", "without patterns")):
                         groups[candidate, label, subset].append(reference / row[candidate])

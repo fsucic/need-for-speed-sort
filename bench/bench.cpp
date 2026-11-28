@@ -26,6 +26,8 @@
 #include <pthread.h>
 
 #include "nfss.h"
+#include "nfss_r5.h"
+#include "nfss_radix_lowmem2.h"
 #include "nfss_base.h"  // frozen copy of the original nfss.h (namespace nfs_base) for same-run before/after
 #ifdef NFS_BENCH_RADIX
 #include "nfs_radix.h"
@@ -149,6 +151,37 @@ static void generate(const Options &o, std::vector<T> &v, std::mt19937_64 &rng, 
         pool->sample(v, n, rng, o.last_input);
         return;
     }
+    if (d == "edge_equal" || d == "edge_two" || d == "edge_top" || d == "edge_bottom") {
+        using U = std::conditional_t<sizeof(T) == 8, uint64_t, uint32_t>;
+        U a = std::bit_cast<U>(T(1));
+        U b = std::bit_cast<U>(T(37));
+        if (d == "edge_equal") b = a;
+        if (d == "edge_top") b = a ^ (U(1) << (8 * sizeof(T) - 1));
+        if (d == "edge_bottom") b = a ^ U(1);
+        for (T &x : v) x = std::bit_cast<T>(rng() & 1 ? a : b);
+        return;
+    }
+    if (d == "edge_ieee" || d == "edge_wide" || d == "edge_denorm" || d == "edge_nan") {
+        if constexpr (std::is_same_v<T, double>) {
+            const std::array<uint64_t, 14> raw = {
+                0, 0x8000000000000000, 1, 0x8000000000000001, 0x000fffffffffffff,
+                0x800fffffffffffff, 0x7fefffffffffffff, 0xffefffffffffffff, 0x7ff0000000000000,
+                0xfff0000000000000, 0x7ff8000000001234, 0xfff8000000005678, 0x7ff0000000000001,
+                0xfff0000000000021};
+            for (auto &x : v) {
+                uint64_t bits = raw[rng() % raw.size()];
+                if (d == "edge_nan") bits = raw[10 + rng() % 4];
+                if (d == "edge_denorm") bits = rng() & 0x800fffffffffffffULL;
+                if (d == "edge_wide") {
+                    bits = rng();
+                    if ((bits & 0x7ff0000000000000ULL) == 0x7ff0000000000000ULL)
+                        bits ^= 0x0010000000000000ULL;
+                }
+                x = std::bit_cast<double>(bits);
+            }
+            return;
+        } else die("IEEE edge inputs require --type f64");
+    }
     if (d == "uniform") fill([&] { return unif(rng) * span; });
     else if (d == "sorted") sorted_uniform();
     else if (d == "reverse") { sorted_uniform(); std::reverse(v.begin(), v.end()); }
@@ -258,6 +291,8 @@ template <typename T>
 static std::map<std::string, std::function<void(std::vector<T> &)>> algorithms() {
     using It = typename std::vector<T>::iterator;
     return {
+        {"classic5", [](auto &v) { nfs_r5::sort(v.begin(), v.end()); }},
+        {"lowmem2", [](auto &v) { nfs_radix_lowmem2::sort(v.begin(), v.end()); }},
         {"nfss", [](auto &v) { nfs::sort(v.begin(), v.end()); }},
         {"nfss_base", [](auto &v) { nfs_base::sort(v.begin(), v.end()); }},
 #ifdef NFS_BENCH_RADIX
@@ -307,10 +342,25 @@ static int run(const Options &o, SosdPool *pool) {
     generate<T>(o, input, rng, pool);
     const uint64_t fp = fingerprint(input);
     if (o.check_only) {
+        auto less = [](T a, T b) {
+            if constexpr (std::is_floating_point_v<T>) return !std::isnan(a) && (std::isnan(b) || a < b);
+            else return a < b;
+        };
+        using Bits = std::conditional_t<sizeof(T) == 8, uint64_t, uint32_t>;
+        const auto bit_less = [](T a, T b) { return std::bit_cast<Bits>(a) < std::bit_cast<Bits>(b); };
+        const auto bit_equal = [](T a, T b) { return std::bit_cast<Bits>(a) == std::bit_cast<Bits>(b); };
+        const bool edge = o.dist.starts_with("edge_");
+        auto reference = edge ? input : std::vector<T>{};
+        if (edge) std::sort(reference.begin(), reference.end(), bit_less);
         for (const auto &name : names) {
             work = input;
             all.at(name)(work);
-            if (!std::is_sorted(work.begin(), work.end()) || fingerprint(work) != fp) {
+            bool valid = std::is_sorted(work.begin(), work.end(), less) && fingerprint(work) == fp;
+            if (edge && valid) {
+                std::sort(work.begin(), work.end(), bit_less);
+                valid = std::equal(work.begin(), work.end(), reference.begin(), bit_equal);
+            }
+            if (!valid) {
                 std::cerr << "FAIL " << o.dist << ',' << o.type << ',' << o.n << ',' << name << '\n';
                 ++failures;
             }
@@ -371,7 +421,9 @@ int main(int argc, char **argv) {
         else die("unknown flag " + k);
     }
     // macOS cannot pin to a core; the highest QoS keeps the thread on performance cores.
+#ifdef __APPLE__
     pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
+#endif
 
     if (repetitions.empty() || sizes.empty() || (repetitions.size() != 1 && repetitions.size() != sizes.size()))
         die("--runs needs one count or one count per size");

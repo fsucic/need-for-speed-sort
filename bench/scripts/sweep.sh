@@ -29,6 +29,21 @@ esac
 if [[ $name == check ]]; then
   printf '%s\0' "${dists[@]}" | xargs -0 -P 12 -n 1 "$binary" --check --algos "$algos" \
     --type "${TYPE:-u64,i64,u32,f64}" --n "${CHECK_SIZES:-1,2,17,1000}" --runs 1 --dist
+  edge_algos=()
+  for candidate in lowmem2 classic5; do
+    if [[ ,$algos, == *,"$candidate",* ]]; then edge_algos+=("$candidate"); fi
+  done
+  if (( ${#edge_algos[@]} )); then
+    selected=$(IFS=,; echo "${edge_algos[*]}")
+    for dist in edge_equal edge_two edge_top edge_bottom; do
+      "$binary" --check --algos "$selected" --type "${TYPE:-u64,i64,u32,f64}" --n "${CHECK_SIZES:-1,2,17,1000}" --dist "$dist"
+    done
+    if [[ ,${TYPE:-u64,i64,u32,f64}, == *,f64,* ]]; then
+      for dist in edge_wide edge_denorm edge_ieee edge_nan; do
+        "$binary" --check --algos "$selected" --type f64 --n "${CHECK_SIZES:-1,2,17,1000}" --dist "$dist"
+      done
+    fi
+  fi
   exit
 fi
 

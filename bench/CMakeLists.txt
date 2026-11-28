@@ -6,10 +6,16 @@ if(NOT CMAKE_BUILD_TYPE)
   set(CMAKE_BUILD_TYPE Release)
 endif()
 # Paper: -O3 -march=native -DNDEBUG. Apple clang takes -mcpu=native on arm64.
-set(CMAKE_CXX_FLAGS_RELEASE "-O3 -mcpu=native -DNDEBUG")
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(arm64|aarch64)$")
+  set(native_flag -mcpu=native)
+else()
+  set(native_flag -march=native)
+endif()
+set(CMAKE_CXX_FLAGS_RELEASE "-O3 ${native_flag} -DNDEBUG")
 
 find_package(Boost 1.80 REQUIRED CONFIG)
 add_executable(nfsbench bench.cpp)
+add_executable(fran_f64 fran_f64.cpp)
 target_include_directories(nfsbench PRIVATE
   ${CMAKE_SOURCE_DIR}/..
   ${CMAKE_SOURCE_DIR}/third_party/ips4o/include
@@ -33,5 +39,9 @@ foreach(variant IN ITEMS radix classic)
     file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/nfs_${variant}.h" "${header}")
     target_include_directories(nfsbench PRIVATE "${CMAKE_CURRENT_BINARY_DIR}")
     target_compile_definitions(nfsbench PRIVATE NFS_BENCH_${upper})
+    if(variant STREQUAL "radix")
+      target_include_directories(fran_f64 PRIVATE "${CMAKE_CURRENT_BINARY_DIR}")
+      target_compile_definitions(fran_f64 PRIVATE NFS_BENCH_RADIX)
+    endif()
   endif()
 endforeach()
