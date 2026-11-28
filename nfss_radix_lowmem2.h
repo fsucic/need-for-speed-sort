@@ -42,7 +42,30 @@
 #endif
 
 namespace nfs_radix_lowmem2 {
+    /*
+     * Low-memory radix sort, round 2 (32/64-bit integers and IEEE floats;
+     * unstable; NaNs placed last with zero signs and NaN payloads preserved).
+     *
+     * Usage: nfs_radix_lowmem2::sort(v.begin(), v.end());
+     * Memory: one fixed heap buffer of at most 896 KiB per call plus O(log n) stack.
+     * Tuning: define NFS_LOWMEM2_CACHE_LINE_BYTES, NFS_LOWMEM2_L1D_BYTES and
+     *         NFS_LOWMEM2_L2_BYTES (defaults 64 B / 32 KiB / 1 MiB) identically across
+     *         translation units to match the CPU's fast on-chip memory.
+     *
+     * Main stages (shares prechecks, memory cap, and staged scatters with nfss_r5.h,
+     * differing in the bucket formula: slices bit groups instead of value interpolation):
+     * - Prechecks: merge up to 4 long sorted runs, count inputs with few distinct
+     *   values in a hash table, or pull out and merge back displaced keys when the
+     *   input is nearly sorted.
+     * - Distribution: split mixed-sign floats by magnitude bits or peel integer
+     *   outliers at the root, then scatter keys by bit slice (using unused bits of
+     *   each word for narrow integer ranges, or in-place block shuffling otherwise).
+     * - Small buckets (leaves): direct counting for dense integers, two-digit
+     *   counting radix for medium spans, or a ~4x slot table with an occupancy
+     *   bitmap for well-spread keys.
+     */
     namespace internal {
+        // Buffer limits derived from the CPU's on-chip memory sizes, capped at 896 KiB.
         constexpr std::size_t line_bytes = NFS_LOWMEM2_CACHE_LINE_BYTES;
         constexpr std::size_t l1_bytes = NFS_LOWMEM2_L1D_BYTES;
         constexpr std::size_t l2_bytes = NFS_LOWMEM2_L2_BYTES;
@@ -50,6 +73,7 @@ namespace nfs_radix_lowmem2 {
         static_assert(l1_bytes >= line_bytes && l2_bytes >= l1_bytes);
         constexpr std::size_t buffer_limit = 896 * 1024;
         constexpr std::size_t merge_bytes = std::min(buffer_limit, l2_bytes);
+        // Find the end of a sorted run; exits in 8 keys on random input, then checks 64 keys at a time.
         template <bool descending, typename T> static T *run_end(T *first, T *last) {
             auto breaks_run = [](T a, T b) {
                 if constexpr (descending)
@@ -72,6 +96,7 @@ namespace nfs_radix_lowmem2 {
             return p;
         }
 
+        // Merge two runs of similar length 8 keys at a time with fixed compare-swap steps instead of per-key branches (speeds up organ-pipe and multi-run inputs).
         template <unsigned W, typename T, typename It, typename Less>
         static void merge_blocks(It a, It a_end, It b, It b_end, It out, Less less) {
             std::array<T, W> carry;
@@ -123,6 +148,7 @@ namespace nfs_radix_lowmem2 {
             if (out != b) std::copy(b, b_end, out);
         }
 
+        // Merge two adjacent sorted runs in place using at most the shared 896 KiB scratch buffer.
         template <typename T> static void merge_runs(T *first, T *middle, T *last, std::unique_ptr<T[]> &buffer) {
             if (middle == first || middle == last || middle[-1] <= *middle) return;
 
@@ -154,6 +180,7 @@ namespace nfs_radix_lowmem2 {
 
             if (!buffer) buffer = std::make_unique_for_overwrite<T[]>(merge_bytes / sizeof(T));
             T *tmp = buffer.get();
+            // Balanced runs merge 8 keys at a time; lopsided runs use a simple loop since the longer side almost always wins.
             if (left_len <= right_len) {
                 std::copy(first, middle, tmp);
                 if (left_len >= 32 && left_len >= right_len / 8) {
@@ -187,6 +214,7 @@ namespace nfs_radix_lowmem2 {
             }
         }
 
+        // Fast path for sorted, reversed, organ-pipe, and half-sorted inputs: detect and merge up to 4 long runs.
         template <typename T, typename Sort> static bool sort_runs(T *first, T *last, Sort sort_remainder) {
             std::unique_ptr<T[]> buffer;
             const auto n = last - first;
@@ -230,6 +258,7 @@ namespace nfs_radix_lowmem2 {
             return true;
         }
 
+        // Map signed integers and IEEE floats to unsigned integers with the same ascending order so buckets can read bit slices.
         template <typename T> static auto order_key(T value) {
             if constexpr (std::is_integral_v<T>) {
                 using U = std::make_unsigned_t<T>;
@@ -245,11 +274,13 @@ namespace nfs_radix_lowmem2 {
             }
         }
 
+        // Read a key's raw bits as an unsigned integer so floats hash and compare by exact bit pattern.
         template <typename T> static auto key_bits(T value) {
             using U = std::conditional_t<sizeof(T) == 8, std::uint64_t, std::uint32_t>;
             return std::bit_cast<U>(value);
         }
 
+        // Sample keys across the array to estimate whether most values are duplicates.
         template <unsigned Samples, typename T, typename Hash>
         static unsigned sample_repeats(const T *data, std::size_t n, Hash hash) {
             std::array<T, 2 * Samples> keys;
@@ -270,6 +301,7 @@ namespace nfs_radix_lowmem2 {
             return repeats;
         }
 
+        // Fast path for inputs with few distinct values: count keys in a hash table, sort the unique keys, and expand counts.
         template <typename T> static bool count_repeated(T *data, std::size_t n) {
             if (n < 1024) return false;
             auto hash = [](T x) {
@@ -324,6 +356,7 @@ namespace nfs_radix_lowmem2 {
             }
             return true;
         }
+        // Plain insertion sort for tiny slices (< 32 keys) and local cleanup.
         template <typename T> static void insertion_sort(T *first, T *last) {
             for (T *p = first + 1; p < last; ++p) {
                 const T value = *p;
@@ -336,6 +369,7 @@ namespace nfs_radix_lowmem2 {
             }
         }
 
+        // Shared scratch layout (<= 896 KiB): holds scatter/sparse buffers, two-digit counts, and per-level bucket ends.
         constexpr unsigned slots = 1u << 16;
         constexpr unsigned histogram_bits = 15;
         constexpr unsigned digit_bits = std::clamp<unsigned>(std::bit_width(l2_bytes / (8 * line_bytes)), 8, 11);
@@ -352,6 +386,7 @@ namespace nfs_radix_lowmem2 {
         };
         template <typename T>
         constexpr unsigned leaf_size = std::clamp<std::size_t>(l2_bytes / (4 * sizeof(T)), 256, slots - 1);
+        // In-place bucket scatter: batch keys into small blocks, cycle full blocks into place, then append leftover tails.
         template <typename T, typename Classify>
         static void fragment_scatter(T *data, std::size_t n, unsigned bins, Classify classify, Workspace<T> &ws,
                                      std::size_t *ends) {
@@ -363,6 +398,7 @@ namespace nfs_radix_lowmem2 {
             std::fill_n(used, bins, 0u);
             std::fill_n(ends, bins, std::size_t(0));
             std::size_t written = 0;
+            // Pass 1: collect keys into per-bucket blocks and flush full blocks sequentially into data.
             for (std::size_t i = 0; i < n; ++i) {
                 const T x = data[i];
                 const unsigned b = classify(x);
@@ -382,6 +418,7 @@ namespace nfs_radix_lowmem2 {
                 packed += ends[b];
                 ends[b] = packed;
             }
+            // Pass 2: cycle full blocks into their target buckets in place.
             for (unsigned b = 0; b < bins; ++b) {
                 while (next[b] != ends[b]) {
                     T *block = data + next[b];
@@ -400,6 +437,7 @@ namespace nfs_radix_lowmem2 {
                     next[b] += block_size;
                 }
             }
+            // Pass 3: shift full blocks right to make room and copy each bucket's partial tail into place.
             std::size_t end = n;
             for (unsigned b = bins; b-- > 0;) {
                 const std::size_t start = b ? ends[b - 1] : 0;
@@ -413,6 +451,7 @@ namespace nfs_radix_lowmem2 {
             }
         }
 
+        // One-pass leaf sort for well-spread keys: place into a ~4x slot table (1 bit per slot tracks occupancy), sweep in order, and fix rare collisions.
         template <typename T, typename Classify>
         static bool sparse_leaf(T *data, std::size_t n, Classify classify, unsigned bins, Workspace<T> &ws) {
             auto *taken = ws.bitmap;
@@ -437,6 +476,7 @@ namespace nfs_radix_lowmem2 {
                 taken[word] |= UINT64_C(1) << bit;
                 items[word * 64 + bit] = data[i];
             }
+            // Sweep occupied slots in order, carrying the running max to resolve adjacent swaps before insertion.
             T *out = data;
             T carry{};
             bool started = false;
@@ -478,6 +518,7 @@ namespace nfs_radix_lowmem2 {
             return true;
         }
 
+        // Two-digit counting radix leaf: builds both histograms in one scan, then scatters low bits to scratch and high bits back (speeds up narrow integer leaves like wiki and Facebook).
         template <typename T, typename U, typename Read>
         static void radix_leaf(T *data, std::size_t n, Workspace<T> &ws, U base, U span, int half, Read read) {
             const unsigned lower_bins = 1u << half;
@@ -505,6 +546,7 @@ namespace nfs_radix_lowmem2 {
             }
         }
 
+        // Cheap 64-point check to spot nearly sorted inputs (such as a small share of random swaps).
         template <typename T> static bool looks_ordered(const T *data, std::size_t n) {
             if (n < 128) return false;
             unsigned adjacent = 0, distant = 0;
@@ -516,6 +558,7 @@ namespace nfs_radix_lowmem2 {
             return adjacent <= 8 && distant <= 10;
         }
 
+        // Exact min/max scan across four independent trackers so the CPU can run comparisons in parallel.
         template <typename T> static std::pair<T, T> extrema(const T *data, std::size_t n) {
             std::array<T, 4> low, high;
             low.fill(data[0]);
@@ -533,6 +576,7 @@ namespace nfs_radix_lowmem2 {
             return {*std::min_element(low.begin(), low.end()), *std::max_element(high.begin(), high.end())};
         }
 
+        // Fast path for nearly sorted inputs: pull out displaced keys (up to n/6), sort only those, and merge them back.
         template <bool Batched, typename T, typename Sort>
         static bool repair_order(T *data, std::size_t n, Workspace<T> &ws, Sort sort_extra) {
             auto *extra = ws.items;
@@ -583,6 +627,7 @@ namespace nfs_radix_lowmem2 {
                 sort_extra(kept, count);
                 std::copy_n(kept, count, extra);
             }
+            // Merge the sorted displaced keys back into the ordered backbone (8 keys at a time when breaks are rare).
             auto right = extra + count;
             T *dest = data + n;
             if constexpr (Batched) {
@@ -610,6 +655,7 @@ namespace nfs_radix_lowmem2 {
 
         template <typename T> using Key = decltype(order_key(T{}));
 
+        // Count bucket sizes and turn them into starting write offsets.
         template <typename T, typename Map>
         static void bucket_starts(const T *data, std::size_t n, unsigned bins, Map position, std::size_t *ends) {
             std::fill_n(ends, bins, std::size_t(0));
@@ -617,6 +663,7 @@ namespace nfs_radix_lowmem2 {
             std::exclusive_scan(ends, ends + bins, ends, std::size_t(0));
         }
 
+        // Half-word staging: when keys fit in half the element width, scatter offsets into the unused upper half of each slot in one pass.
         template <typename T> using Half = std::conditional_t<sizeof(T) == 8, std::uint32_t, std::uint16_t>;
         template <bool Upper, typename T> static Half<T> read_half(const T *slot) {
             constexpr unsigned offset = (Upper == (std::endian::native == std::endian::little)) ? sizeof(Half<T>) : 0;
@@ -642,6 +689,7 @@ namespace nfs_radix_lowmem2 {
                 std::memcpy(slot, &d, sizeof(d));
             }
         }
+        // For mixed-sign floats, sample active magnitude bits and mirror negative buckets so values near zero spread evenly instead of piling into one bucket.
         template <typename T, typename SortBucket>
         static bool magnitude_partition(T *data, std::size_t n, unsigned bins, bool leaf, Workspace<T> &ws,
                                         SortBucket sort_bucket) {
@@ -697,6 +745,7 @@ namespace nfs_radix_lowmem2 {
             return true;
         }
 
+        // Packed-range scatter: keep source bits in the low part of each word and stash destination offsets in the free upper bits (speeds up medium integer spans).
         template <typename T> struct PackedRange {
             using U = std::make_unsigned_t<T>;
             unsigned width;
@@ -720,6 +769,7 @@ namespace nfs_radix_lowmem2 {
                 }
             }
         };
+        // Main recursive radix driver: splits mixed-sign floats, peels integer outliers, counts dense ranges, and scatters by bit slices.
         template <typename T>
         static void distribute(T *data, std::size_t n, Workspace<T> &ws, unsigned depth = 0, Key<T> base = 1,
                                Key<T> high_key = 0) {
@@ -732,6 +782,7 @@ namespace nfs_radix_lowmem2 {
             const auto desired = std::clamp<std::size_t>(1 + (n - 1) / target, 256, max_bins);
             const unsigned fanout = std::bit_ceil(unsigned(desired));
             const unsigned bins = leaf ? std::min(slots, std::bit_ceil(unsigned(n)) * 4) : fanout;
+            // At the root, split mixed-sign floats by magnitude window before falling back to order_key bit slices.
             if constexpr (std::is_floating_point_v<T>) {
                 if (!depth && n >= 1024) {
                     const auto sort_bucket = [&](T *first, std::size_t count, Key<T> lo, Key<T> hi) {
@@ -763,6 +814,7 @@ namespace nfs_radix_lowmem2 {
             if (!span) return;
             const int width = std::bit_width(span);
 
+            // Outlier peeling for integers: sample 64 keys at the root and split off extreme tails that inflate the bit span.
             if constexpr (std::is_integral_v<T>) {
                 if (!depth && n >= 1024) {
                     std::array<Key<T>, 64> sample;
@@ -789,6 +841,7 @@ namespace nfs_radix_lowmem2 {
                     }
                 }
             }
+            // Dense integer range that fits in scratch: finish directly with counting sort (speeds up heavy-tail centers).
             if constexpr (std::is_integral_v<T>) {
                 if (!leaf && span < slots && span < n && n <= std::uintmax_t(std::numeric_limits<T>::max())) {
                     const unsigned values = unsigned(span) + 1;
@@ -800,6 +853,7 @@ namespace nfs_radix_lowmem2 {
                     return;
                 }
             }
+            // Leaf paths: direct counting, two-digit radix, sparse table, then crowded-leaf split or histogram fallback.
             if (leaf) {
                 if constexpr (std::is_integral_v<T>) {
                     if (span < 4 * n && span < std::size(ws.counts)) {
@@ -831,6 +885,7 @@ namespace nfs_radix_lowmem2 {
                     return;
                 }
 
+                // Crowded leaf fallback: partition into up to 256 smaller bit-slice buckets and recurse.
                 if (n >= 256 && width > 1 && depth + 1 < std::size(ws.ends)) {
                     const unsigned target = std::clamp(unsigned(n) / 64, 4u, 256u);
                     const unsigned shift = unsigned(std::max(0, width - int(std::bit_width(target - 1))));
@@ -853,6 +908,7 @@ namespace nfs_radix_lowmem2 {
                     }
                     return;
                 }
+                // Final leaf fallback when recursion rows are exhausted or n < 256: bucket into scratch and finish with insertion sort.
                 const unsigned groups = std::bit_ceil(unsigned(n)) / 2;
                 const int group_shift = std::max(0, width - int(std::bit_width(groups - 1)));
                 auto group = [=](T x) { return unsigned((order_key(x) - base) >> group_shift); };
@@ -877,6 +933,7 @@ namespace nfs_radix_lowmem2 {
                 std::sort(data, data + n);
                 return;
             }
+            // Pick the bit shift for this pass; widen buckets on dense integer ranges so children fit the counting table.
             int shift = std::max(0, width - int(std::bit_width(bins - 1)));
             if constexpr (std::is_integral_v<T>) {
                 if (span / 2 < n && width > 1) {
@@ -886,6 +943,7 @@ namespace nfs_radix_lowmem2 {
             }
             auto position = [=](T x) { return unsigned((order_key(x) - base) >> shift); };
             const unsigned used = unsigned(span >> shift) + 1;
+            // Choose the cheapest scatter: half-word staging, bit-packed staging, or general in-place block scatter.
             auto *ends = ws.ends[depth];
             bool half_staged = false, packed_staged = false;
             T low_value{};
@@ -911,6 +969,7 @@ namespace nfs_radix_lowmem2 {
                 }
                 return;
             }
+            // Unpack staged children (feeding eligible half-staged leaves straight into radix_leaf) and recurse with tight bounds.
             std::size_t first = 0;
             for (unsigned b = 0; b < used; ++b) {
                 const auto child = ends[b] - first;
@@ -947,6 +1006,7 @@ namespace nfs_radix_lowmem2 {
             }
         }
 
+        // Split a large nearly-sorted input with median-of-3 pivots until each chunk fits repair_order's scratch budget.
         template <bool Batched, typename T>
         static void split_ordered(T *data, std::size_t n, Workspace<T> &ws, std::size_t target) {
             if (n <= target) {
@@ -1001,6 +1061,7 @@ namespace nfs_radix_lowmem2 {
             using Work = internal::Workspace<T>;
             static_assert(sizeof(Work) <= internal::buffer_limit);
             auto work = std::make_unique_for_overwrite<Work>();
+            // Sample out-of-order neighbors to choose 8-key batched repair, one-by-one repair, or full distribution.
             if (internal::looks_ordered(a, n)) {
                 unsigned breaks = 0;
                 const unsigned probes = unsigned(std::min<std::size_t>(256, n - 1));

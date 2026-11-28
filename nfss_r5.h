@@ -43,7 +43,29 @@
 #endif
 
 namespace nfs_r5 {
+    /*
+     * Value-interpolation NFS Sort, round 5 (32/64-bit integers and IEEE floats;
+     * unstable; NaNs placed last with zero signs and NaN payloads preserved).
+     *
+     * Usage: nfs_r5::sort(v.begin(), v.end());
+     * Memory: one fixed heap buffer of at most 896 KiB per call plus O(log n) stack.
+     * Tuning: define NFS_R5_CACHE_LINE_BYTES, NFS_R5_L1D_BYTES and NFS_R5_L2_BYTES
+     *         (defaults 64 B / 32 KiB / 1 MiB) identically across translation units
+     *         to match the CPU's fast on-chip memory.
+     *
+     * Main stages:
+     * - Prechecks: merge up to 4 long sorted runs, count inputs with few distinct
+     *   values in a hash table, or pull out and merge back displaced keys when the
+     *   input is nearly sorted.
+     * - Distribution: peel extreme outliers at the root, then scatter keys into
+     *   proportional value buckets (using unused bits of each word for narrow
+     *   integer ranges, or in-place block shuffling otherwise).
+     * - Small buckets (leaves): direct counting for dense integers, 16-bit offset
+     *   pages sorted with vector networks for medium integer spans, or a ~4x slot
+     *   table with an occupancy bitmap for well-spread keys.
+     */
     namespace internal {
+        // Buffer limits derived from the CPU's on-chip memory sizes, capped at 896 KiB.
         constexpr std::size_t line_bytes = NFS_R5_CACHE_LINE_BYTES;
         constexpr std::size_t l1_bytes = NFS_R5_L1D_BYTES;
         constexpr std::size_t l2_bytes = NFS_R5_L2_BYTES;
@@ -51,6 +73,7 @@ namespace nfs_r5 {
         static_assert(l1_bytes >= line_bytes && l2_bytes >= l1_bytes);
         constexpr std::size_t buffer_limit = 896 * 1024;
         constexpr std::size_t merge_bytes = std::min(buffer_limit, l2_bytes);
+        // Find the end of a sorted run; exits in 8 keys on random input, then checks 64 keys at a time.
         template <bool descending, typename T> static T *run_end(T *first, T *last) {
             auto breaks_run = [](T a, T b) {
                 if constexpr (descending)
@@ -73,6 +96,7 @@ namespace nfs_r5 {
             return p;
         }
 
+        // Merge two runs of similar length 8 keys at a time with fixed compare-swap steps instead of per-key branches (speeds up organ-pipe and multi-run inputs).
         template <unsigned W, typename T, typename It, typename Less>
         static void merge_blocks(It a, It a_end, It b, It b_end, It out, Less less) {
             std::array<T, W> carry;
@@ -124,6 +148,7 @@ namespace nfs_r5 {
             if (out != b) std::copy(b, b_end, out);
         }
 
+        // Merge two adjacent sorted runs in place using at most the shared 896 KiB scratch buffer.
         template <typename T> static void merge_runs(T *first, T *middle, T *last, std::unique_ptr<T[]> &buffer) {
             if (middle == first || middle == last || middle[-1] <= *middle) return;
 
@@ -155,6 +180,7 @@ namespace nfs_r5 {
 
             if (!buffer) buffer = std::make_unique_for_overwrite<T[]>(merge_bytes / sizeof(T));
             T *tmp = buffer.get();
+            // Balanced runs merge 8 keys at a time; lopsided runs use a simple loop since the longer side almost always wins.
             if (left_len <= right_len) {
                 std::copy(first, middle, tmp);
                 if (left_len >= 32 && left_len >= right_len / 8) {
@@ -188,6 +214,7 @@ namespace nfs_r5 {
             }
         }
 
+        // Fast path for sorted, reversed, organ-pipe, and half-sorted inputs: detect and merge up to 4 long runs.
         template <typename T, typename Sort> static bool sort_runs(T *first, T *last, Sort sort_remainder) {
             std::unique_ptr<T[]> buffer;
             const auto n = last - first;
@@ -231,11 +258,13 @@ namespace nfs_r5 {
             return true;
         }
 
+        // Read a key's raw bits as an unsigned integer so floats hash and compare by exact bit pattern.
         template <typename T> static auto key_bits(T value) {
             using U = std::conditional_t<sizeof(T) == 8, std::uint64_t, std::uint32_t>;
             return std::bit_cast<U>(value);
         }
 
+        // Sample keys across the array to estimate whether most values are duplicates.
         template <unsigned Samples, typename T, typename Hash>
         static unsigned sample_repeats(const T *data, std::size_t n, Hash hash) {
             std::array<T, 2 * Samples> keys;
@@ -256,6 +285,7 @@ namespace nfs_r5 {
             return repeats;
         }
 
+        // Fast path for inputs with few distinct values: count keys in a hash table, sort the unique keys, and expand counts.
         template <typename T> static bool count_repeated(T *data, std::size_t n) {
             if (n < 1024) return false;
             auto hash = [](T x) {
@@ -310,6 +340,7 @@ namespace nfs_r5 {
             }
             return true;
         }
+        // Plain insertion sort for tiny slices (< 32 keys) and local cleanup.
         template <typename T> static void insertion_sort(T *first, T *last) {
             for (T *p = first + 1; p < last; ++p) {
                 const T value = *p;
@@ -322,6 +353,7 @@ namespace nfs_r5 {
             }
         }
 
+        // Shared scratch layout (<= 896 KiB): overlays general scatter/sparse buffers with 16-bit offset-page storage.
         constexpr unsigned slots = 1u << 16;
         constexpr unsigned max_bins =
             std::clamp<std::size_t>(std::bit_floor(l1_bytes / (2 * sizeof(std::size_t))), 32, 2048);
@@ -350,6 +382,7 @@ namespace nfs_r5 {
         constexpr unsigned leaf_size = std::clamp<std::size_t>(l2_bytes / (4 * sizeof(T)), 256, slots - 1);
         template <typename T>
         constexpr unsigned target_leaf = std::clamp<std::size_t>(l1_bytes / (2 * sizeof(T)), 256, slots / 4);
+        // In-place bucket scatter: batch keys into small blocks, cycle full blocks into place, then append leftover tails.
         template <typename T, typename Classify>
         static void fragment_scatter(T *data, std::size_t n, unsigned bins, Classify classify, Workspace<T> &ws,
                                      std::size_t *ends) {
@@ -361,6 +394,7 @@ namespace nfs_r5 {
             std::fill_n(used, bins, 0u);
             std::fill_n(ends, bins, std::size_t(0));
             std::size_t written = 0;
+            // Pass 1: collect keys into per-bucket blocks and flush full blocks sequentially into data.
             for (std::size_t i = 0; i < n; ++i) {
                 const T x = data[i];
                 const unsigned b = classify(x);
@@ -380,6 +414,7 @@ namespace nfs_r5 {
                 packed += ends[b];
                 ends[b] = packed;
             }
+            // Pass 2: cycle full blocks into their target buckets in place.
             for (unsigned b = 0; b < bins; ++b) {
                 while (next[b] != ends[b]) {
                     T *block = data + next[b];
@@ -398,6 +433,7 @@ namespace nfs_r5 {
                     next[b] += block_size;
                 }
             }
+            // Pass 3: shift full blocks right to make room and copy each bucket's partial tail into place.
             std::size_t end = n;
             for (unsigned b = bins; b-- > 0;) {
                 const std::size_t start = b ? ends[b - 1] : 0;
@@ -411,6 +447,7 @@ namespace nfs_r5 {
             }
         }
 
+        // One-pass leaf sort for well-spread keys: place into a ~4x slot table (1 bit per slot tracks occupancy), sweep in order, and fix rare collisions.
         template <typename T, typename Classify, typename Read>
         static bool sparse_read(T *data, std::size_t n, Classify classify, unsigned bins, Workspace<T> &ws, Read read) {
             auto *taken = ws.general.bitmap;
@@ -436,6 +473,7 @@ namespace nfs_r5 {
                 taken[word] |= UINT64_C(1) << bit;
                 items[word * 64 + bit] = value;
             }
+            // Sweep occupied slots in order, carrying the running max to resolve adjacent swaps before insertion.
             T *out = data;
             T carry{};
             bool started = false;
@@ -482,6 +520,7 @@ namespace nfs_r5 {
             return sparse_read(data, n, classify, bins, ws, [&](std::size_t i) { return data[i]; });
         }
 
+        // Cheap 64-point check to spot nearly sorted inputs (such as a small share of random swaps).
         template <typename T> static bool looks_ordered(const T *data, std::size_t n) {
             if (n < 128) return false;
             unsigned adjacent = 0, distant = 0;
@@ -493,6 +532,7 @@ namespace nfs_r5 {
             return adjacent <= 8 && distant <= 10;
         }
 
+        // Exact min/max scan across four independent trackers so the CPU can run comparisons in parallel.
         template <typename T> static std::pair<T, T> extrema(const T *data, std::size_t n) {
             std::array<T, 4> low, high;
             low.fill(data[0]);
@@ -510,6 +550,7 @@ namespace nfs_r5 {
             return {*std::min_element(low.begin(), low.end()), *std::max_element(high.begin(), high.end())};
         }
 
+        // Fast path for nearly sorted inputs: pull out displaced keys (up to n/6), sort only those, and merge them back.
         template <bool Batched, typename T, typename Sort>
         static bool repair_order(T *data, std::size_t n, Workspace<T> &ws, Sort sort_extra) {
             auto *extra = ws.general.items;
@@ -561,6 +602,7 @@ namespace nfs_r5 {
                 extra = ws.general.items;
                 std::copy_n(kept, count, extra);
             }
+            // Merge the sorted displaced keys back into the ordered backbone (8 keys at a time when breaks are rare).
             auto right = extra + count;
             T *dest = data + n;
             if constexpr (Batched) {
@@ -586,6 +628,7 @@ namespace nfs_r5 {
             return true;
         }
 
+        // Value-interpolation map: assigns keys to proportional buckets using exact integer math (128-bit multiply-and-shift instead of division) and recovers exact bucket bounds.
         template <typename T> struct ValueMap {
             T low;
             std::uint64_t width = 0;
@@ -640,6 +683,7 @@ namespace nfs_r5 {
             }
         };
 
+        // Fallback leaf when sparse placement overflows: bucket into scratch, sort any bucket over 24 keys, and finish with insertion sort.
         template <typename T, typename Position>
         static void histogram_leaf(T *data, unsigned n, unsigned bins, Position position, Workspace<T> &ws) {
             auto *ends = ws.counts;
@@ -657,6 +701,7 @@ namespace nfs_r5 {
             std::copy_n(ws.general.items, n, data);
         }
 
+// Fixed compare-swap sorting networks for 16-bit offsets (8 values per vector instruction, up to 256 values) so the CPU never has to guess branches.
 #if defined(__clang__) || (defined(__GNUC__) && __GNUC__ >= 12)
         using Lanes = std::uint16_t __attribute__((vector_size(16)));
 
@@ -721,10 +766,12 @@ namespace nfs_r5 {
         }
 #endif
 
+        // Check whether an integer leaf fits in 16-bit offset pages (speeds up dense ID datasets like Facebook).
         static bool uses_offset_pages(std::size_t n, std::uint64_t span) {
             return n >= 128 && n < slots && span >= 256 * n && span < (1u << 30) && 1 + span / UINT16_MAX <= n / 2;
         }
 
+        // Split a medium-span integer leaf into slices <= 65,535 wide, sort their 16-bit offsets with vector networks grouped by size, and rebuild full keys.
         template <typename T>
         static bool network_leaf(T *data, unsigned n, T low, std::uint64_t span, Workspace<T> &ws) {
             using U = std::make_unsigned_t<T>;
@@ -738,6 +785,7 @@ namespace nfs_r5 {
             std::fill_n(counts, bins, 0u);
             for (unsigned i = 0; i < n; ++i) ++counts[bucket(unsigned(U(U(data[i]) - U(low))))];
 
+            // Group buckets by power-of-two size class, padded with UINT16_MAX so sorting networks run uniformly.
             auto *pages = ::new (&ws.pages) typename Workspace<T>::Pages;
             auto *values = pages->values;
             auto *cursor = pages->cursor;
@@ -798,6 +846,7 @@ namespace nfs_r5 {
             sort_group.template operator()<7>();
             sort_group.template operator()<8>();
 
+            // Rebuild full keys from base + sorted 16-bit offsets (buckets over 256 fall back to std::sort).
             T *out = data;
             for (unsigned b = 0; b < bins; ++b) {
                 const unsigned count = counts[b];
@@ -817,6 +866,7 @@ namespace nfs_r5 {
             return true;
         }
 
+        // Count bucket sizes and turn them into starting write offsets.
         template <typename T, typename Map>
         static void bucket_starts(const T *data, std::size_t n, unsigned bins, Map position, std::size_t *ends) {
             std::fill_n(ends, bins, std::size_t(0));
@@ -824,6 +874,7 @@ namespace nfs_r5 {
             std::exclusive_scan(ends, ends + bins, ends, std::size_t(0));
         }
 
+        // Half-word staging: when keys fit in half the element width, scatter offsets into the unused upper half of each slot in one pass.
         template <typename T> using Half = std::conditional_t<sizeof(T) == 8, std::uint32_t, std::uint16_t>;
         template <bool Upper, typename T> static Half<T> read_half(const T *slot) {
             constexpr unsigned offset = (Upper == (std::endian::native == std::endian::little)) ? sizeof(Half<T>) : 0;
@@ -850,6 +901,7 @@ namespace nfs_r5 {
             }
         }
 
+        // Packed-range scatter: keep source bits in the low part of each word and stash destination offsets in the free upper bits (speeds up medium integer spans).
         template <typename T> struct PackedRange {
             using U = std::make_unsigned_t<T>;
             unsigned width;
@@ -873,6 +925,7 @@ namespace nfs_r5 {
                 }
             }
         };
+        // Main recursive driver: handles outliers, counting leaves, offset pages, sparse leaves, and staged or block scatters.
         template <typename T>
         static void distribute(T *data, std::size_t n, Workspace<T> &ws, unsigned depth = 0, T low = T(1),
                                T high = T(0)) {
@@ -895,6 +948,7 @@ namespace nfs_r5 {
             if constexpr (std::is_integral_v<T>) {
                 using U = std::make_unsigned_t<T>;
                 const auto span = U(U(high) - U(low));
+                // Dense integer range that fits in the scratch table: finish directly with counting sort (speeds up heavy-tail centers).
                 if (!leaf && span < slots && span < n && n <= std::uintmax_t(std::numeric_limits<T>::max())) {
                     const unsigned values = unsigned(span) + 1;
                     std::fill_n(ws.general.items, values, T(0));
@@ -911,6 +965,7 @@ namespace nfs_r5 {
             if constexpr (std::is_integral_v<T>) {
                 using U = std::make_unsigned_t<T>;
                 const auto span = U(U(high) - U(low));
+                // For dense integer spans, size buckets so each child fits the counting table.
                 if (!leaf && span / 2 < n) {
                     const auto per_interval = std::min<std::size_t>(slots - 1, l1_bytes / sizeof(T));
                     bins = unsigned(std::clamp<std::uint64_t>(1 + span / per_interval, 2, max_bins));
@@ -923,6 +978,7 @@ namespace nfs_r5 {
                     return;
                 }
             }
+            // Outlier peeling: sample 96 keys at the root and split off extreme tails so they don't squash the main range.
             if (depth == 0 && n >= 1024) {
                 std::array<T, 96> sample;
                 const auto stride = n / sample.size();
@@ -954,6 +1010,7 @@ namespace nfs_r5 {
                     return;
                 }
             }
+            // Leaf paths: direct counting, 16-bit offset pages, sparse table, then crowded-leaf split or histogram fallback.
             if (leaf) {
                 if constexpr (std::is_integral_v<T>) {
                     const auto span = position.distance(high);
@@ -977,6 +1034,7 @@ namespace nfs_r5 {
                 if constexpr (std::is_integral_v<T>)
                     if (network_leaf(data, unsigned(n), low, position.distance(high), ws)) return;
                 if (sparse_leaf(data, n, position, bins, ws)) return;
+                // Crowded leaf fallback: remeasure tight bounds and partition into up to 256 smaller buckets.
                 if (n >= 256 && depth + 1 < std::size(ws.ends)) {
                     if (inherited) {
                         const auto exact = extrema(data, n);
@@ -1024,6 +1082,7 @@ namespace nfs_r5 {
                 std::sort(data, data + n);
                 return;
             }
+            // Choose the cheapest scatter: half-word staging, bit-packed staging, or general in-place block scatter.
             auto *ends = ws.ends[depth];
             bool half_staged = false, packed_staged = false;
             unsigned source_bits = 0, stored_bits = 0;
@@ -1047,6 +1106,7 @@ namespace nfs_r5 {
                 }
             }
             if (!half_staged && !packed_staged) fragment_scatter(data, n, bins, position, ws, ends);
+            // Unpack staged children (feeding eligible half-staged leaves straight into sparse_read) and recurse.
             std::size_t first = 0;
             for (unsigned b = 0; b < bins; ++b) {
                 const auto child = ends[b] - first;
@@ -1083,6 +1143,7 @@ namespace nfs_r5 {
             }
         }
 
+        // Split a large nearly-sorted input with median-of-3 pivots until each chunk fits repair_order's scratch budget.
         template <bool Batched, typename T>
         static void split_ordered(T *data, std::size_t n, Workspace<T> &ws, std::size_t target) {
             if (n <= target) {
@@ -1137,6 +1198,7 @@ namespace nfs_r5 {
             using Work = internal::Workspace<T>;
             static_assert(sizeof(Work) <= internal::buffer_limit);
             auto work = std::make_unique_for_overwrite<Work>();
+            // Sample out-of-order neighbors to choose 8-key batched repair, one-by-one repair, or full distribution.
             if (internal::looks_ordered(a, n)) {
                 unsigned breaks = 0;
                 const unsigned probes = unsigned(std::min<std::size_t>(256, n - 1));
